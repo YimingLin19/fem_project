@@ -2,7 +2,7 @@ from __future__ import  annotations
 
 import csv
 from typing import Dict, List, Optional, Tuple
-from .mesh import Node2D, Element2D, TrussMesh2D, BeamMesh2D, PlaneMesh2D
+from .mesh import Node2D, Element2D, TrussMesh2D, BeamMesh2D, PlaneMesh2D, Node3D, Element3D, HexMesh3D
 
 
 def read_materials_as_dict(path: str) -> Dict[int, Dict[str, str]]:
@@ -781,3 +781,102 @@ def read_quad8_2d_abaqus(
                 e.node_ids = [n1_id, n4_id, n3_id, n2_id, n8_id, n7_id, n6_id, n5_id]
 
     return PlaneMesh2D(nodes=nodes, elements=elements)
+
+
+def read_hex8_csv(
+    mesh_path: str,
+    material_path: Optional[str] = None,
+) -> HexMesh3D:
+    """Read a Hex8 mesh CSV with optional materials."""
+
+    materials_dict: Dict[int, Dict[str, str]] = {}
+    if material_path is not None:
+        materials_dict = read_materials_as_dict(material_path)
+
+    nodes: List[Node3D] = []
+    elements: List[Element3D] = []
+
+    mode: Optional[str] = None
+
+    with open(mesh_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+
+        for line_no, row in enumerate(reader, start=1):
+            row = [col.strip() for col in row]
+
+            if not row or all(col == "" for col in row):
+                continue
+
+            if row[0].startswith("#"):
+                continue
+
+            # 节点表头
+            if row[0] == "node_id":
+                mode = "nodes"
+                continue
+
+            # 单元表头
+            if row[0] == "elem_id":
+                mode = "elements"
+                continue
+
+            if mode == "nodes":
+                if len(row) < 4:
+                    raise ValueError(f"第 {line_no} 行节点格式错误: {row!r}")
+                nid = int(row[0])
+                x = float(row[1])
+                y = float(row[2])
+                z = float(row[3])
+                nodes.append(Node3D(id=nid, x=x, y=y, z=z))
+
+            elif mode == "elements":
+                if len(row) < 10:
+                    raise ValueError(f"第 {line_no} 行 Hex8 单元格式错误: {row!r}")
+                eid = int(row[0])
+                n1 = int(row[1])
+                n2 = int(row[2])
+                n3 = int(row[3])
+                n4 = int(row[4])
+                n5 = int(row[5])
+                n6 = int(row[6])
+                n7 = int(row[7])
+                n8 = int(row[8])
+                mid = int(row[9])
+
+                props: Dict[str, object] = {
+                    "material_id": mid,
+                }
+
+                if materials_dict:
+                    mat_row = materials_dict.get(mid)
+                    if mat_row is not None:
+                        raw_E = _get_float_from_material(mat_row, ["E"])
+                        raw_nu = _get_float_from_material(mat_row, ["nu", "poisson"])
+                        raw_rho = _get_float_from_material(mat_row, ["rho"])
+                        if raw_E is not None:
+                            props["E"] = raw_E
+                        if raw_nu is not None:
+                            props["nu"] = raw_nu
+                        if raw_rho is not None:
+                            props["rho"] = raw_rho
+
+                elements.append(
+                    Element3D(
+                        id=eid,
+                        node_ids=[n1, n2, n3, n4, n5, n6, n7, n8],
+                        type="Hex8",
+                        props=props,
+                    )
+                )
+
+            else:
+                raise ValueError(
+                    f"在未识别出表头前遇到数据行（第 {line_no} 行）: {row!r}"
+                )
+
+    if not nodes:
+        raise ValueError("mesh csv 中没有读到节点")
+    if not elements:
+        raise ValueError("mesh csv 中没有读到单元")
+
+    return HexMesh3D(nodes=nodes, elements=elements)

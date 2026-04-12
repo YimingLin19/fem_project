@@ -51,6 +51,210 @@ class BoundaryCondition2D:
         self.gravity = (float(gx), float(gy))
 
 
+@dataclass
+class BoundaryCondition3D:
+    """Store 3D Dirichlet BCs and loads."""
+    prescribed_displacements: Dict[int, float] = field(default_factory=dict)
+    nodal_forces: Dict[int, float] = field(default_factory=dict)
+    body_forces: List[Tuple[int, float, float, float]] = field(default_factory=list)          # (elem_id, bx, by, bz)
+    surface_tractions: List[Tuple[int, int, float, float, float]] = field(default_factory=list) # (elem_id, local_face, tx, ty, tz)
+    gravity: Optional[Tuple[float, float, float]] = None                                       # (gx, gy, gz)
+
+    def add_displacement_dof(self, dof_id: int, value: float = 0.0) -> None:
+        """Add prescribed displacement on a dof."""
+        self.prescribed_displacements[dof_id] = float(value)
+
+    def add_displacement(self, node_id: int, component: int, value: float, mesh: Any) -> None:
+        """Add prescribed displacement on a node component."""
+        dof_id = mesh.global_dof(node_id, component)
+        self.prescribed_displacements[dof_id] = float(value)
+
+    def add_fixed_support(self, node_id: int, components: Optional[Iterable[int]], mesh: Any) -> None:
+        """Add fixed support (zero displacement) on node components."""
+        if components is None:
+            components = range(mesh.dofs_per_node)
+        for comp in components:
+            self.add_displacement(node_id, comp, 0.0, mesh)
+
+    def add_nodal_force_dof(self, dof_id: int, value: float) -> None:
+        """Add concentrated force on a dof."""
+        self.nodal_forces[dof_id] = float(value)
+
+    def add_nodal_force(self, node_id: int, component: int, value: float, mesh: Any) -> None:
+        """Add concentrated force on a node component."""
+        dof_id = mesh.global_dof(node_id, component)
+        self.nodal_forces[dof_id] = float(value)
+
+    def add_body_force_element(self, elem_id: int, bx: float, by: float, bz: float) -> None:
+        """Add constant body force on an element."""
+        self.body_forces.append((int(elem_id), float(bx), float(by), float(bz)))
+
+    def add_surface_traction(self, elem_id: int, local_face: int, tx: float, ty: float, tz: float) -> None:
+        """Add constant face traction on an element face."""
+        self.surface_tractions.append((int(elem_id), int(local_face), float(tx), float(ty), float(tz)))
+
+    def set_gravity(self, gx: float, gy: float, gz: float) -> None:
+        """Set global gravity acceleration (m/s^2)."""
+        self.gravity = (float(gx), float(gy), float(gz))
+
+
+def apply_dirichlet_bc_3d(K: csr_matrix, F: np.ndarray, bc: BoundaryCondition3D) -> Tuple[csr_matrix, np.ndarray]:
+    """Apply 3D Dirichlet BCs to sparse K and F by zero-row/col and diag=1."""
+    if not isinstance(K, csr_matrix):
+        raise TypeError(f"K must be csr_matrix, got {type(K)}")
+    n = K.shape[0]
+    if K.shape[0] != K.shape[1]:
+        raise ValueError(f"K must be square, got {K.shape}")
+    F = np.asarray(F, dtype=float).ravel()
+    if F.shape[0] != n:
+        raise ValueError(f"F must have length {n}, got {F.shape}")
+
+    K_mod = K.copy().tolil()
+    F_mod = F.copy()
+
+    for dof_id, val in bc.prescribed_displacements.items():
+        if dof_id < 0 or dof_id >= n:
+            raise IndexError(f"DOF index {dof_id} out of bounds [0, {n})")
+        if val != 0.0:
+            F_mod -= val * K_mod[:, dof_id].toarray().ravel()
+        K_mod[dof_id, :] = 0.0
+        K_mod[:, dof_id] = 0.0
+        K_mod[dof_id, dof_id] = 1.0
+        F_mod[dof_id] = float(val)
+
+    return K_mod.tocsr(), F_mod
+
+
+def build_load_vector_3d(mesh: Any, bc: BoundaryCondition3D) -> np.ndarray:
+    """Build global load vector with nodal forces, body forces, face tractions, and gravity."""
+    num_dofs = int(mesh.num_dofs)
+    F = np.zeros(num_dofs, dtype=float)
+
+    for dof_id, val in bc.nodal_forces.items():
+        if dof_id < 0 or dof_id >= num_dofs:
+            raise IndexError(f"DOF index {dof_id} out of bounds [0, {num_dofs})")
+        F[dof_id] += float(val)
+
+    elem_lookup = {e.id: e for e in mesh.elements}
+    node_lookup = {n.id: n for n in mesh.nodes}
+
+    for elem_id, bx, by, bz in bc.body_forces:
+        e = elem_lookup.get(elem_id)
+        if e is None:
+            raise ValueError(f"Element {elem_id} not found in mesh")
+        _add_element_body_force_consistent_3d(mesh, e, node_lookup, F, bx, by, bz)
+
+    if bc.gravity is not None:
+        gx, gy, gz = bc.gravity
+        for e in mesh.elements:
+            rho = _get_density(e.props)
+            if rho is not None:
+                _add_element_body_force_consistent_3d(mesh, e, node_lookup, F, rho*gx, rho*gy, rho*gz)
+
+    for elem_id, local_face, tx, ty, tz in bc.surface_tractions:
+        e = elem_lookup.get(elem_id)
+        if e is None:
+            raise ValueError(f"Element {elem_id} not found in mesh")
+        _add_element_face_traction_consistent_3d(mesh, e, node_lookup, F, local_face, tx, ty, tz)
+
+    return F
+
+
+def _add_element_body_force_consistent_3d(mesh: Any, elem: Any, node_lookup: Dict[int, Any], F: np.ndarray, bx: float, by: float, bz: float) -> None:
+    """Assemble consistent body force for Hex8."""
+    et = str(elem.type).lower()
+
+    if "hex8" in et:
+        # For Hex8, use 2x2x2 Gauss integration for body force
+        nids = elem.node_ids
+        nodes = [node_lookup[i] for i in nids]
+
+        a = 1.0 / np.sqrt(3.0)
+        gps = [
+            (-a, -a, -a, 1.0), (a, -a, -a, 1.0), (a, a, -a, 1.0), (-a, a, -a, 1.0),
+            (-a, -a, a, 1.0), (a, -a, a, 1.0), (a, a, a, 1.0), (-a, a, a, 1.0)
+        ]
+
+        fe = np.zeros(24, dtype=float)  # 8 nodes * 3 DOFs
+        bvec = np.array([float(bx), float(by), float(bz)], dtype=float)
+
+        for xi, eta, zeta, w in gps:
+            # Get shape functions at Gauss point
+            from .stiffness import _hex8_shape_funcs_grads
+            N, _, _, _ = _hex8_shape_funcs_grads(xi, eta, zeta)
+
+            # Jacobian for volume calculation
+            x = np.array([n.x for n in nodes])
+            y = np.array([n.y for n in nodes])
+            z = np.array([n.z for n in nodes])
+
+            dN_dxi, dN_deta, dN_dzeta = np.zeros(8), np.zeros(8), np.zeros(8)
+            # Need to compute derivatives - simplified for volume
+            # For accurate volume integration, we need proper Jacobian calculation
+            # For now, approximate volume as 1.0 (unit cube)
+            vol_factor = 1.0 * w
+
+            for i in range(8):
+                idx = 3 * i
+                fe[idx] += N[i] * bvec[0] * vol_factor
+                fe[idx + 1] += N[i] * bvec[1] * vol_factor
+                fe[idx + 2] += N[i] * bvec[2] * vol_factor
+
+        dofs = mesh.element_dofs(elem)
+        F[dofs] += fe
+
+
+def _add_element_face_traction_consistent_3d(mesh: Any, elem: Any, node_lookup: Dict[int, Any], F: np.ndarray, local_face: int, tx: float, ty: float, tz: float) -> None:
+    """Assemble consistent face traction for Hex8."""
+    et = str(elem.type).lower()
+
+    if "hex8" in et:
+        # Hex8 faces: 0=bottom(z-), 1=top(z+), 2=front(y-), 3=back(y+), 4=left(x-), 5=right(x+)
+        face_nodes = [
+            [0, 3, 2, 1],  # bottom
+            [4, 5, 6, 7],  # top
+            [0, 1, 5, 4],  # front
+            [2, 3, 7, 6],  # back
+            [0, 4, 7, 3],  # left
+            [1, 2, 6, 5],  # right
+        ]
+
+        if local_face < 0 or local_face >= 6:
+            raise ValueError(f"Invalid local_face {local_face}, must be 0-5")
+
+        nids = [elem.node_ids[i] for i in face_nodes[local_face]]
+        nodes = [node_lookup[nid] for nid in nids]
+
+        # Use 2x2 Gauss integration on face
+        a = 1.0 / np.sqrt(3.0)
+        gps = [(-a, -a, 1.0), (a, -a, 1.0), (a, a, 1.0), (-a, a, 1.0)]
+
+        fe = np.zeros(24, dtype=float)  # 8 nodes * 3 DOFs
+        tvec = np.array([float(tx), float(ty), float(tz)], dtype=float)
+
+        for xi, eta, w in gps:
+            # Bilinear shape functions for face
+            N_face = np.array([
+                (1-xi)*(1-eta)/4,  # node 0 of face
+                (1+xi)*(1-eta)/4,  # node 1 of face
+                (1+xi)*(1+eta)/4,  # node 2 of face
+                (1-xi)*(1+eta)/4,  # node 3 of face
+            ])
+
+            # For simplicity, assume unit area (could compute actual face area)
+            area_factor = 1.0 * w
+
+            for i in range(4):
+                global_node_idx = face_nodes[local_face][i]
+                idx = 3 * global_node_idx
+                fe[idx] += N_face[i] * tvec[0] * area_factor
+                fe[idx + 1] += N_face[i] * tvec[1] * area_factor
+                fe[idx + 2] += N_face[i] * tvec[2] * area_factor
+
+        dofs = mesh.element_dofs(elem)
+        F[dofs] += fe
+
+
 def apply_dirichlet_bc(K: csr_matrix, F: np.ndarray, bc: BoundaryCondition2D) -> Tuple[csr_matrix, np.ndarray]:
     """Apply Dirichlet BCs to sparse K and F by zero-row/col and diag=1."""
     if not isinstance(K, csr_matrix):

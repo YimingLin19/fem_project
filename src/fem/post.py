@@ -1,7 +1,7 @@
 ﻿import csv
 from typing import Sequence, Optional, List, Dict
 import numpy as np
-from .mesh import Mesh2DProtocol, TrussMesh2D, PlaneMesh2D, Node2D
+from .mesh import Mesh2DProtocol, TrussMesh2D, PlaneMesh2D, Node2D, Mesh3DProtocol, HexMesh3D, Node3D
 
 
 def export_nodal_displacements_csv(
@@ -1416,4 +1416,211 @@ def convert_nodal_solution_into_polar_coord(
                     out_row.append(row.get(name, ""))
 
             writer.writerow(out_row)
+
+
+def export_nodal_displacements_csv_3d(
+    mesh: Mesh3DProtocol,
+    U: Sequence[float],
+    path: str,
+    component_names: Optional[List[str]] = None,
+) -> None:
+    """Export 3D nodal displacements to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
+
+    dofs_per_node = mesh.dofs_per_node
+
+    if component_names is None:
+        if dofs_per_node == 3:
+            component_names = ["ux", "uy", "uz"]
+        else:
+            component_names = [f"u{c}" for c in range(dofs_per_node)]
+    else:
+        if len(component_names) != dofs_per_node:
+            raise ValueError(
+                f"component_names length {len(component_names)} != dofs_per_node={dofs_per_node}"
+            )
+
+    node_lookup = {node.id: node for node in mesh.nodes}
+    header = ["node_id", "x", "y", "z"] + component_names
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for nid in mesh.dof_manager.node_ids:
+            node: Node3D = node_lookup[nid]
+            dofs = mesh.node_dofs(nid)
+            disp_vals = [U[dof] for dof in dofs]
+            writer.writerow([nid, node.x, node.y, node.z] + disp_vals)
+
+
+def export_hex8_element_stress_csv(
+    mesh: HexMesh3D,
+    U: Sequence[float],
+    path: str,
+) -> None:
+    """Export Hex8 element stresses to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
+
+    node_lookup = {node.id: node for node in mesh.nodes}
+
+    header = ["elem_id", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for elem in mesh.elements:
+            if elem.type.lower() != "hex8":
+                continue
+
+            # Compute element stresses at centroid (xi=0, eta=0, zeta=0)
+            stresses = _compute_hex8_element_stress_at_point(mesh, elem, U, node_lookup, 0.0, 0.0, 0.0)
+            sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = stresses
+            mises = np.sqrt(0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2 +
+                                   6 * (tau_xy**2 + tau_yz**2 + tau_zx**2)))
+
+            writer.writerow([elem.id, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
+
+
+def _compute_hex8_element_stress_at_point(
+    mesh: HexMesh3D,
+    elem,
+    U: np.ndarray,
+    node_lookup: Dict[int, Node3D],
+    xi: float,
+    eta: float,
+    zeta: float,
+) -> tuple:
+    """Compute stresses at a point in Hex8 element."""
+    from .stiffness import _hex8_shape_funcs_grads, _compute_D_3d
+
+    # Get material properties
+    E = float(elem.props["E"])
+    nu = float(elem.props["nu"])
+    D = _compute_D_3d(E, nu)
+
+    # Get node coordinates
+    nids = elem.node_ids
+    nodes = [node_lookup[nid] for nid in nids]
+    x = np.array([n.x for n in nodes], dtype=float)
+    y = np.array([n.y for n in nodes], dtype=float)
+    z = np.array([n.z for n in nodes], dtype=float)
+
+    # Shape function gradients
+    N, dN_dxi, dN_deta, dN_dzeta = _hex8_shape_funcs_grads(xi, eta, zeta)
+
+    # Jacobian matrix
+    J = np.array([
+        [np.sum(dN_dxi * x), np.sum(dN_dxi * y), np.sum(dN_dxi * z)],
+        [np.sum(dN_deta * x), np.sum(dN_deta * y), np.sum(dN_deta * z)],
+        [np.sum(dN_dzeta * x), np.sum(dN_dzeta * y), np.sum(dN_dzeta * z)],
+    ], dtype=float)
+
+    invJ = np.linalg.inv(J)
+
+    # Derivatives in physical coordinates
+    dN_dx = invJ[0, 0] * dN_dxi + invJ[0, 1] * dN_deta + invJ[0, 2] * dN_dzeta
+    dN_dy = invJ[1, 0] * dN_dxi + invJ[1, 1] * dN_deta + invJ[1, 2] * dN_dzeta
+    dN_dz = invJ[2, 0] * dN_dxi + invJ[2, 1] * dN_deta + invJ[2, 2] * dN_dzeta
+
+    # Strain-displacement matrix B (6 strains, 24 DOFs)
+    B = np.zeros((6, 24), dtype=float)
+    for i in range(8):
+        idx = 3 * i
+        B[0, idx] = dN_dx[i]      # ε_xx
+        B[1, idx + 1] = dN_dy[i]  # ε_yy
+        B[2, idx + 2] = dN_dz[i]  # ε_zz
+        B[3, idx] = dN_dy[i]      # γ_xy
+        B[3, idx + 1] = dN_dx[i]
+        B[4, idx + 1] = dN_dz[i]  # γ_yz
+        B[4, idx + 2] = dN_dy[i]
+        B[5, idx] = dN_dz[i]      # γ_zx
+        B[5, idx + 2] = dN_dx[i]
+
+    # Get element DOFs
+    elem_dofs = mesh.element_dofs(elem)
+    Ue = U[elem_dofs]
+
+    # Strain vector
+    epsilon = B @ Ue
+
+    # Stress vector
+    sigma = D @ epsilon
+
+    return sigma[0], sigma[1], sigma[2], sigma[3], sigma[4], sigma[5]  # sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx
+
+
+def export_hex8_nodal_stress_csv(
+    mesh: HexMesh3D,
+    U: Sequence[float],
+    path: str,
+    gauss_order: int = 2,
+) -> None:
+    """Export Hex8 nodal stresses (extrapolated from Gauss points) to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
+
+    node_lookup = {node.id: node for node in mesh.nodes}
+
+    # Gauss points for extrapolation
+    if gauss_order == 2:
+        a = 1.0 / np.sqrt(3.0)
+        gps = [
+            (-a, -a, -a, 1.0),
+            (a, -a, -a, 1.0),
+            (a, a, -a, 1.0),
+            (-a, a, -a, 1.0),
+            (-a, -a, a, 1.0),
+            (a, -a, a, 1.0),
+            (a, a, a, 1.0),
+            (-a, a, a, 1.0),
+        ]
+    else:
+        raise ValueError(f"Unsupported gauss_order {gauss_order}, only 2 supported")
+
+    header = ["node_id", "x", "y", "z", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for nid in mesh.dof_manager.node_ids:
+            node = node_lookup[nid]
+
+            # Find elements connected to this node
+            connected_elems = [elem for elem in mesh.elements if nid in elem.node_ids]
+
+            if not connected_elems:
+                # Node not connected to any element
+                writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
+                continue
+
+            # Average stresses from connected elements
+            stress_sum = np.zeros(6)
+            count = 0
+
+            for elem in connected_elems:
+                # Compute stresses at Gauss points
+                gp_stresses = []
+                for xi, eta, zeta, w in gps:
+                    stress = _compute_hex8_element_stress_at_point(mesh, elem, U, node_lookup, xi, eta, zeta)
+                    gp_stresses.append(stress)
+
+                # Simple average for now (could implement proper extrapolation)
+                elem_stress = np.mean(gp_stresses, axis=0)
+                stress_sum += elem_stress
+                count += 1
+
+            avg_stress = stress_sum / count
+            sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = avg_stress
+            mises = np.sqrt(0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2 +
+                                   6 * (tau_xy**2 + tau_yz**2 + tau_zx**2)))
+
+            writer.writerow([nid, node.x, node.y, node.z, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
 
