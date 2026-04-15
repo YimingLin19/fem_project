@@ -1,7 +1,7 @@
 ﻿import csv
 from typing import Sequence, Optional, List, Dict
 import numpy as np
-from .mesh import Mesh2DProtocol, TrussMesh2D, PlaneMesh2D, Node2D, Mesh3DProtocol, HexMesh3D, Node3D
+from .mesh import Mesh2DProtocol, TrussMesh2D, PlaneMesh2D, Node2D, Mesh3DProtocol, HexMesh3D, TetMesh3D, Node3D
 
 
 def export_nodal_displacements_csv(
@@ -20,8 +20,6 @@ def export_nodal_displacements_csv(
     if component_names is None:
         if dofs_per_node == 2:
             component_names = ["ux", "uy"]
-        elif dofs_per_node == 3:
-            component_names = ["ux", "uy", "uz"]
         else:
             component_names = [f"u{c}" for c in range(dofs_per_node)]
     else:
@@ -739,13 +737,34 @@ def _build_vtk_cells(mesh, node_id_to_pt_idx: Dict[int, int]):
             pt_ids = [node_id_to_pt_idx[nid] for nid in elem.node_ids]
             vtk_conn = [8] + pt_ids
             vtk_type = 23
-        
+
+        elif "tet4" in etype:
+            if len(elem.node_ids) != 4:
+                continue
+            pt_ids = [node_id_to_pt_idx[nid] for nid in elem.node_ids]
+            vtk_conn = [4] + pt_ids
+            vtk_type = 10  # VTK_TETRA
+
+        elif "tet10" in etype:
+            if len(elem.node_ids) != 10:
+                continue
+            # For visualization, split Tet10 into 4 linear Tet4 sub-elements
+            # using only corner nodes. This avoids VTK quadratic element
+            # rendering artifacts (spikes/gaps on shared faces).
+            # Abaqus C3D10 corners: 1,2,3,4 (indices 0,1,2,3)
+            corners = [elem.node_ids[0], elem.node_ids[1],
+                       elem.node_ids[2], elem.node_ids[3]]
+            pt_ids = [node_id_to_pt_idx[nid] for nid in corners]
+            # Use linear tetrahedron type for clean visualization
+            vtk_conn = [4] + pt_ids
+            vtk_type = 10  # VTK_TETRA (linear)
+
         elif "hex8" in etype:
             if len(elem.node_ids) != 8:
                 continue
             pt_ids = [node_id_to_pt_idx[nid] for nid in elem.node_ids]
             vtk_conn = [8] + pt_ids
-            vtk_type = 12
+            vtk_type = 12  # VTK_HEXAHEDRON
 
         else:
             continue
@@ -903,8 +922,8 @@ def _convert_element_stress_fields_to_polar(
 
 
 def _write_vtk(mesh, cells, cell_types, elems_for_cell, node_disp, field_data, vtk_path: str, nodal_fields: Optional[Dict[str, Dict[int, float]]] = None):
-    """Write VTK file from node displacements and cell fields."""
-    nodes: List[Node2D] = mesh.nodes
+    """Write VTK file from node displacements and cell fields. Supports both 2D and 3D meshes."""
+    nodes = mesh.nodes
     num_points = len(nodes)
     num_cells = len(cells)
 
@@ -916,6 +935,10 @@ def _write_vtk(mesh, cells, cell_types, elems_for_cell, node_disp, field_data, v
             arr[cidx] = float(field_dict.get(eid, 0.0))
         cell_field_arrays[field_name] = arr
 
+    # Detect 3D vs 2D: check if first node has 'z' attribute
+    is_3d = len(nodes) > 0 and hasattr(nodes[0], 'z')
+    dofs_per_node = mesh.dofs_per_node
+
     with open(vtk_path, "w", encoding="utf-8") as f:
         f.write("# vtk DataFile Version 3.0\n")
         f.write("FEM results from CSV\n")
@@ -924,7 +947,10 @@ def _write_vtk(mesh, cells, cell_types, elems_for_cell, node_disp, field_data, v
 
         f.write(f"POINTS {num_points} float\n")
         for node in nodes:
-            f.write(f"{node.x} {node.y} 0.0\n")
+            if is_3d:
+                f.write(f"{node.x} {node.y} {node.z}\n")
+            else:
+                f.write(f"{node.x} {node.y} 0.0\n")
 
         total_ints = sum(len(conn) for conn in cells)
         f.write(f"\nCELLS {num_cells} {total_ints}\n")
@@ -938,15 +964,19 @@ def _write_vtk(mesh, cells, cell_types, elems_for_cell, node_disp, field_data, v
         f.write(f"\nPOINT_DATA {num_points}\n")
         f.write("VECTORS displacement float\n")
         for node in nodes:
-            disp = node_disp.get(node.id, {"ux": 0.0, "uy": 0.0, "rz": 0.0})
-            f.write(f"{disp['ux']} {disp['uy']} 0.0\n")
+            disp = node_disp.get(node.id, {"ux": 0.0, "uy": 0.0, "uz": 0.0, "rz": 0.0})
+            if is_3d:
+                f.write(f"{disp.get('ux', 0.0)} {disp.get('uy', 0.0)} {disp.get('uz', 0.0)}\n")
+            else:
+                f.write(f"{disp.get('ux', 0.0)} {disp.get('uy', 0.0)} 0.0\n")
 
-        has_any_rz = any(abs(d.get("rz", 0.0)) > 0.0 for d in node_disp.values())
-        if getattr(mesh, "dofs_per_node", 0) >= 3 and has_any_rz:
-            f.write("\nSCALARS rotz float 1\n")
-            f.write("LOOKUP_TABLE default\n")
-            for node in nodes:
-                f.write(f"{node_disp.get(node.id, {}).get('rz', 0.0)}\n")
+        if not is_3d and getattr(mesh, "dofs_per_node", 0) >= 3:
+            has_any_rz = any(abs(d.get("rz", 0.0)) > 0.0 for d in node_disp.values())
+            if has_any_rz:
+                f.write("\nSCALARS rotz float 1\n")
+                f.write("LOOKUP_TABLE default\n")
+                for node in nodes:
+                    f.write(f"{node_disp.get(node.id, {}).get('rz', 0.0)}\n")
 
         if nodal_fields:
             for field_name, field_dict in nodal_fields.items():
@@ -984,13 +1014,15 @@ def export_vtk_from_csv(
             raise ValueError(f"Disp CSV requires columns {required_cols}, got {reader.fieldnames}")
 
         has_rz = "rz" in reader.fieldnames
+        has_uz = "uz" in reader.fieldnames
 
         for row in reader:
             nid = int(row["node_id"])
             ux = float(row["ux"])
             uy = float(row["uy"])
             rz = float(row["rz"]) if has_rz and row.get("rz", "") != "" else 0.0
-            node_disp[nid] = {"ux": ux, "uy": uy, "rz": rz}
+            uz = float(row["uz"]) if has_uz and row.get("uz", "") != "" else 0.0
+            node_disp[nid] = {"ux": ux, "uy": uy, "uz": uz, "rz": rz}
 
     for node in mesh.nodes:
         if node.id not in node_disp:
@@ -1008,7 +1040,7 @@ def export_vtk_from_csv(
             if "node_id" not in (reader.fieldnames or []):
                 raise ValueError(f"Nodal stress CSV requires 'node_id', got {reader.fieldnames}")
 
-            ignore_exact = {"node_id", "x", "y"}
+            ignore_exact = {"node_id", "x", "y", "z"}
             field_names = [name for name in (reader.fieldnames or []) if name not in ignore_exact]
 
             for name in field_names:
@@ -1634,170 +1666,317 @@ def export_hex8_nodal_stress_csv(
             writer.writerow([nid, node.x, node.y, node.z, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
 
 
-def _write_vtk_3d(
-    mesh,
-    cells,
-    cell_types,
-    elems_for_cell,
-    node_disp,
-    field_data,
-    vtk_path: str,
-    nodal_fields: Optional[Dict[str, Dict[int, float]]] = None,
-):
-    """Write 3D VTK file from node displacements and cell fields."""
-    nodes: List[Node3D] = mesh.nodes
-    num_points = len(nodes)
-    num_cells = len(cells)
+# ============================================================
+# Tet4 (3D tetrahedral) stress computation and export
+# ============================================================
 
-    cell_field_arrays: Dict[str, np.ndarray] = {}
-    for field_name, field_dict in field_data.items():
-        arr = np.zeros(num_cells, dtype=float)
-        for cidx, elem in enumerate(elems_for_cell):
-            eid = elem.id
-            arr[cidx] = float(field_dict.get(eid, 0.0))
-        cell_field_arrays[field_name] = arr
+def _compute_tet4_element_stress_at_point(
+    mesh: Mesh3DProtocol,
+    elem,
+    U: np.ndarray,
+    node_lookup: Dict[int, Node3D],
+    xi: float,
+    eta: float,
+    zeta: float,
+) -> tuple:
+    """Compute 3D stresses at a point in a Tet4 element."""
+    from .stiffness import _tet4_shape_funcs_grads, _compute_D_3d
 
-    with open(vtk_path, "w", encoding="utf-8") as f:
-        f.write("# vtk DataFile Version 3.0\n")
-        f.write("FEM 3D results from CSV\n")
-        f.write("ASCII\n")
-        f.write("DATASET UNSTRUCTURED_GRID\n")
+    E = float(elem.props["E"])
+    nu = float(elem.props["nu"])
+    D = _compute_D_3d(E, nu)
 
-        f.write(f"POINTS {num_points} float\n")
-        for node in nodes:
-            f.write(f"{node.x} {node.y} {node.z}\n")
+    nids = elem.node_ids
+    nodes = [node_lookup[nid] for nid in nids]
+    x = np.array([n.x for n in nodes], dtype=float)
+    y = np.array([n.y for n in nodes], dtype=float)
+    z = np.array([n.z for n in nodes], dtype=float)
 
-        total_ints = sum(len(conn) for conn in cells)
-        f.write(f"\nCELLS {num_cells} {total_ints}\n")
-        for conn in cells:
-            f.write(" ".join(str(v) for v in conn) + "\n")
+    N, dN_dxi, dN_deta, dN_dzeta = _tet4_shape_funcs_grads(xi, eta, zeta)
 
-        f.write(f"\nCELL_TYPES {num_cells}\n")
-        for ct in cell_types:
-            f.write(f"{ct}\n")
+    J = np.array([
+        [np.sum(dN_dxi * x), np.sum(dN_dxi * y), np.sum(dN_dxi * z)],
+        [np.sum(dN_deta * x), np.sum(dN_deta * y), np.sum(dN_deta * z)],
+        [np.sum(dN_dzeta * x), np.sum(dN_dzeta * y), np.sum(dN_dzeta * z)],
+    ], dtype=float)
 
-        f.write(f"\nPOINT_DATA {num_points}\n")
-        f.write("VECTORS displacement float\n")
-        for node in nodes:
-            disp = node_disp.get(node.id, {"ux": 0.0, "uy": 0.0, "uz": 0.0})
-            f.write(f"{disp['ux']} {disp['uy']} {disp['uz']}\n")
+    invJ = np.linalg.inv(J)
 
-        if nodal_fields:
-            for field_name, field_dict in nodal_fields.items():
-                f.write(f"\nSCALARS {field_name} float 1\n")
-                f.write("LOOKUP_TABLE default\n")
-                for node in nodes:
-                    f.write(f"{float(field_dict.get(node.id, 0.0))}\n")
+    dN_dx = invJ[0, 0] * dN_dxi + invJ[0, 1] * dN_deta + invJ[0, 2] * dN_dzeta
+    dN_dy = invJ[1, 0] * dN_dxi + invJ[1, 1] * dN_deta + invJ[1, 2] * dN_dzeta
+    dN_dz = invJ[2, 0] * dN_dxi + invJ[2, 1] * dN_deta + invJ[2, 2] * dN_dzeta
 
-        f.write(f"\nCELL_DATA {num_cells}\n")
-        for field_name, arr in cell_field_arrays.items():
-            f.write(f"SCALARS {field_name} float 1\n")
-            f.write("LOOKUP_TABLE default\n")
-            for v in arr:
-                f.write(f"{float(v)}\n")
-            f.write("\n")
-        
-def export_vtk_from_csv_3d(
-    mesh: HexMesh3D,
-    disp_csv_path: str,
-    elem_csv_path: Optional[str],
-    vtk_path: str,
-    nodal_stress_csv_path: Optional[str] = None,
+    # B matrix (6 x 12)
+    B = np.zeros((6, 12), dtype=float)
+    for i in range(4):
+        idx = 3 * i
+        B[0, idx] = dN_dx[i]
+        B[1, idx + 1] = dN_dy[i]
+        B[2, idx + 2] = dN_dz[i]
+        B[3, idx] = dN_dy[i]
+        B[3, idx + 1] = dN_dx[i]
+        B[4, idx + 1] = dN_dz[i]
+        B[4, idx + 2] = dN_dy[i]
+        B[5, idx] = dN_dz[i]
+        B[5, idx + 2] = dN_dx[i]
+
+    elem_dofs = mesh.element_dofs(elem)
+    Ue = U[elem_dofs]
+    epsilon = B @ Ue
+    sigma = D @ epsilon
+
+    return sigma[0], sigma[1], sigma[2], sigma[3], sigma[4], sigma[5]
+
+
+def export_tet4_element_stress_csv(
+    mesh: Mesh3DProtocol,
+    U: Sequence[float],
+    path: str,
 ) -> None:
-    """Convert 3D displacement + Hex8 stress CSV files to VTK."""
-    node_disp: Dict[int, Dict[str, float]] = {}
+    """Export Tet4 element stresses (at centroid) to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
 
-    with open(disp_csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        required_cols = {"node_id", "ux", "uy", "uz"}
-        if not required_cols.issubset(reader.fieldnames or []):
-            raise ValueError(
-                f"3D disp CSV requires columns {required_cols}, got {reader.fieldnames}"
+    node_lookup = {node.id: node for node in mesh.nodes}
+
+    header = ["elem_id", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for elem in mesh.elements:
+            et = str(elem.type).lower()
+            if "tet4" not in et:
+                continue
+
+            stresses = _compute_tet4_element_stress_at_point(
+                mesh, elem, U, node_lookup, 0.25, 0.25, 0.25
             )
+            sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = stresses
+            mises = np.sqrt(
+                0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2)
+                + 3.0 * (tau_xy**2 + tau_yz**2 + tau_zx**2)
+            )
+            writer.writerow([elem.id, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
 
-        for row in reader:
-            nid = int(row["node_id"])
-            ux = float(row["ux"])
-            uy = float(row["uy"])
-            uz = float(row["uz"])
-            node_disp[nid] = {"ux": ux, "uy": uy, "uz": uz}
 
-    for node in mesh.nodes:
-        if node.id not in node_disp:
-            node_disp[node.id] = {"ux": 0.0, "uy": 0.0, "uz": 0.0}
+def export_tet4_nodal_stress_csv(
+    mesh: Mesh3DProtocol,
+    U: Sequence[float],
+    path: str,
+) -> None:
+    """Export Tet4 nodal stresses (averaged from elements) to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
 
-    nodal_fields: Dict[str, Dict[int, float]] = {}
-    if nodal_stress_csv_path is not None:
-        with open(nodal_stress_csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if "node_id" not in (reader.fieldnames or []):
-                raise ValueError(
-                    f"3D nodal stress CSV requires 'node_id', got {reader.fieldnames}"
+    node_lookup = {node.id: node for node in mesh.nodes}
+
+    header = ["node_id", "x", "y", "z", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for nid in mesh.dof_manager.node_ids:
+            node = node_lookup[nid]
+
+            connected_elems = [elem for elem in mesh.elements if nid in elem.node_ids]
+
+            if not connected_elems:
+                writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
+                continue
+
+            stress_sum = np.zeros(6, dtype=float)
+            count = 0
+
+            for elem in connected_elems:
+                et = str(elem.type).lower()
+                if "tet4" not in et:
+                    continue
+                # For Tet4, stress is constant throughout the element (linear tet)
+                stress = _compute_tet4_element_stress_at_point(
+                    mesh, elem, U, node_lookup, 0.25, 0.25, 0.25
                 )
+                stress_sum += np.array(stress)
+                count += 1
 
-            ignore_exact = {"node_id", "x", "y", "z"}
-            field_names = [
-                name for name in (reader.fieldnames or [])
-                if name not in ignore_exact
-            ]
+            if count == 0:
+                writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
+                continue
 
-            for name in field_names:
-                nodal_fields[name] = {}
+            avg = stress_sum / count
+            sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = avg
+            mises = np.sqrt(
+                0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2)
+                + 3.0 * (tau_xy**2 + tau_yz**2 + tau_zx**2)
+            )
+            writer.writerow([nid, node.x, node.y, node.z, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
 
-            for row in reader:
-                nid = int(row["node_id"])
-                for name in field_names:
-                    val_str = row.get(name, "")
-                    if val_str == "":
-                        continue
-                    try:
-                        val = float(val_str)
-                    except ValueError:
-                        val = 0.0
-                    nodal_fields[name][nid] = val
 
-    field_data: Dict[str, Dict[int, float]] = {}
-    if elem_csv_path is not None:
-        with open(elem_csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if "elem_id" not in (reader.fieldnames or []):
-                raise ValueError(
-                    f"3D element stress CSV requires 'elem_id', got {reader.fieldnames}"
-                )
+def _compute_tet10_element_stress_at_point(
+    mesh: Mesh3DProtocol,
+    elem,
+    U: np.ndarray,
+    node_lookup: Dict[int, Node3D],
+    xi: float,
+    eta: float,
+    zeta: float,
+) -> tuple:
+    """Compute 3D stresses at a point in a Tet10 element."""
+    from .stiffness import _tet10_shape_funcs_grads, _compute_D_3d
 
-            ignore_exact = {"elem_id"}
-            field_names = [
-                name for name in (reader.fieldnames or [])
-                if name not in ignore_exact
-            ]
+    E = float(elem.props["E"])
+    nu = float(elem.props["nu"])
+    D = _compute_D_3d(E, nu)
 
-            for name in field_names:
-                field_data[name] = {}
+    nids = elem.node_ids
+    nodes = [node_lookup[nid] for nid in nids]
+    x = np.array([n.x for n in nodes], dtype=float)
+    y = np.array([n.y for n in nodes], dtype=float)
+    z = np.array([n.z for n in nodes], dtype=float)
 
-            for row in reader:
-                eid = int(row["elem_id"])
-                for name in field_names:
-                    val_str = row.get(name, "")
-                    if val_str == "":
-                        continue
-                    try:
-                        val = float(val_str)
-                    except ValueError:
-                        val = 0.0
-                    field_data[name][eid] = val
+    N, dN_dxi, dN_deta, dN_dzeta = _tet10_shape_funcs_grads(xi, eta, zeta)
 
-    node_id_to_pt_idx: Dict[int, int] = {node.id: i for i, node in enumerate(mesh.nodes)}
-    cells, cell_types, elems_for_cell = _build_vtk_cells(mesh, node_id_to_pt_idx)
-    if not cells:
-        raise ValueError("export_vtk_from_csv_3d: no supported elements")
+    J = np.array([
+        [np.sum(dN_dxi * x), np.sum(dN_dxi * y), np.sum(dN_dxi * z)],
+        [np.sum(dN_deta * x), np.sum(dN_deta * y), np.sum(dN_deta * z)],
+        [np.sum(dN_dzeta * x), np.sum(dN_dzeta * y), np.sum(dN_dzeta * z)],
+    ], dtype=float)
 
-    _write_vtk_3d(
-        mesh,
-        cells,
-        cell_types,
-        elems_for_cell,
-        node_disp,
-        field_data,
-        vtk_path,
-        nodal_fields,
-    )
+    invJ = np.linalg.inv(J)
+
+    dN_dx = invJ[0, 0] * dN_dxi + invJ[0, 1] * dN_deta + invJ[0, 2] * dN_dzeta
+    dN_dy = invJ[1, 0] * dN_dxi + invJ[1, 1] * dN_deta + invJ[1, 2] * dN_dzeta
+    dN_dz = invJ[2, 0] * dN_dxi + invJ[2, 1] * dN_deta + invJ[2, 2] * dN_dzeta
+
+    # B matrix (6 x 30)
+    B = np.zeros((6, 30), dtype=float)
+    for i in range(10):
+        idx = 3 * i
+        B[0, idx] = dN_dx[i]
+        B[1, idx + 1] = dN_dy[i]
+        B[2, idx + 2] = dN_dz[i]
+        B[3, idx] = dN_dy[i]
+        B[3, idx + 1] = dN_dx[i]
+        B[4, idx + 1] = dN_dz[i]
+        B[4, idx + 2] = dN_dy[i]
+        B[5, idx] = dN_dz[i]
+        B[5, idx + 2] = dN_dx[i]
+
+    elem_dofs = mesh.element_dofs(elem)
+    Ue = U[elem_dofs]
+    epsilon = B @ Ue
+    sigma = D @ epsilon
+
+    return sigma[0], sigma[1], sigma[2], sigma[3], sigma[4], sigma[5]
+
+
+def export_tet10_element_stress_csv(
+    mesh: Mesh3DProtocol,
+    U: Sequence[float],
+    path: str,
+) -> None:
+    """Export Tet10 element stresses (at centroid) to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
+
+    node_lookup = {node.id: node for node in mesh.nodes}
+
+    header = ["elem_id", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for elem in mesh.elements:
+            et = str(elem.type).lower()
+            if "tet10" not in et:
+                continue
+
+            stresses = _compute_tet10_element_stress_at_point(
+                mesh, elem, U, node_lookup, 0.25, 0.25, 0.25
+            )
+            sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = stresses
+            mises = np.sqrt(
+                0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2)
+                + 3.0 * (tau_xy**2 + tau_yz**2 + tau_zx**2)
+            )
+            writer.writerow([elem.id, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
+
+
+def export_tet10_nodal_stress_csv(
+    mesh: Mesh3DProtocol,
+    U: Sequence[float],
+    path: str,
+) -> None:
+    """Export Tet10 nodal stresses (averaged from elements) to CSV."""
+    U = np.asarray(U, dtype=float).ravel()
+    if U.shape[0] != mesh.num_dofs:
+        raise ValueError(f"U length {U.shape[0]} != mesh.num_dofs={mesh.num_dofs}")
+
+    node_lookup = {node.id: node for node in mesh.nodes}
+
+    # 4-point Hammer integration for stress sampling
+    n = 0.58541020
+    a = (1.0 - n) / 4.0
+    b = (1.0 + 3.0 * n) / 4.0
+    gps = [(a, a, a), (b, a, a), (a, b, a), (a, a, b)]
+
+    header = ["node_id", "x", "y", "z", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for nid in mesh.dof_manager.node_ids:
+            node = node_lookup[nid]
+
+            connected_elems = [elem for elem in mesh.elements if nid in elem.node_ids]
+
+            if not connected_elems:
+                writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
+                continue
+
+            stress_sum = np.zeros(6, dtype=float)
+            count = 0
+
+            for elem in connected_elems:
+                et = str(elem.type).lower()
+                if "tet10" not in et:
+                    continue
+                # Average stress from 4 Gauss points
+                gp_stresses = []
+                for xi, eta, zeta in gps:
+                    stress = _compute_tet10_element_stress_at_point(
+                        mesh, elem, U, node_lookup, xi, eta, zeta
+                    )
+                    gp_stresses.append(stress)
+                elem_stress = np.mean(gp_stresses, axis=0)
+                stress_sum += elem_stress
+                count += 1
+
+            if count == 0:
+                writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
+                continue
+
+            avg = stress_sum / count
+            sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = avg
+            mises = np.sqrt(
+                0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2)
+                + 3.0 * (tau_xy**2 + tau_yz**2 + tau_zx**2)
+            )
+            writer.writerow([nid, node.x, node.y, node.z, sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx, mises])
+
+
+def export_nodal_displacements_csv_3d_tet(
+    mesh: Mesh3DProtocol,
+    U: Sequence[float],
+    path: str,
+) -> None:
+    """Export 3D tetrahedral nodal displacements to CSV (alias for generic 3D export)."""
+    export_nodal_displacements_csv_3d(mesh, U, path)
+
