@@ -20,6 +20,8 @@ def export_nodal_displacements_csv(
     if component_names is None:
         if dofs_per_node == 2:
             component_names = ["ux", "uy"]
+        elif dofs_per_node == 3:
+            component_names = ["ux", "uy", "uz"]
         else:
             component_names = [f"u{c}" for c in range(dofs_per_node)]
     else:
@@ -748,16 +750,12 @@ def _build_vtk_cells(mesh, node_id_to_pt_idx: Dict[int, int]):
         elif "tet10" in etype:
             if len(elem.node_ids) != 10:
                 continue
-            # For visualization, split Tet10 into 4 linear Tet4 sub-elements
-            # using only corner nodes. This avoids VTK quadratic element
-            # rendering artifacts (spikes/gaps on shared faces).
-            # Abaqus C3D10 corners: 1,2,3,4 (indices 0,1,2,3)
-            corners = [elem.node_ids[0], elem.node_ids[1],
-                       elem.node_ids[2], elem.node_ids[3]]
-            pt_ids = [node_id_to_pt_idx[nid] for nid in corners]
-            # Use linear tetrahedron type for clean visualization
-            vtk_conn = [4] + pt_ids
-            vtk_type = 10  # VTK_TETRA (linear)
+            # Abaqus C3D10 and VTK quadratic tetrahedra use the same edge order:
+            # (1,2), (2,3), (3,1), (1,4), (2,4), (3,4).
+            vtk_order = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            pt_ids = [node_id_to_pt_idx[elem.node_ids[i]] for i in vtk_order]
+            vtk_conn = [10] + pt_ids
+            vtk_type = 24  # VTK_QUADRATIC_TETRA
 
         elif "hex8" in etype:
             if len(elem.node_ids) != 8:
@@ -1010,6 +1008,8 @@ def export_vtk_from_csv(
     with open(disp_csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         required_cols = {"node_id", "ux", "uy"}
+        if len(mesh.nodes) > 0 and hasattr(mesh.nodes[0], "z"):
+            required_cols.add("uz")
         if not required_cols.issubset(reader.fieldnames or []):
             raise ValueError(f"Disp CSV requires columns {required_cols}, got {reader.fieldnames}")
 
@@ -1100,6 +1100,23 @@ def export_vtk_from_csv(
         raise ValueError("export_vtk_from_csv: no supported elements")
 
     _write_vtk(mesh, cells, cell_types, elems_for_cell, node_disp, field_data, vtk_path, nodal_fields)
+
+
+def export_vtk_from_csv_3d(
+    mesh: Mesh3DProtocol,
+    disp_csv_path: str,
+    elem_csv_path: Optional[str],
+    vtk_path: str,
+    nodal_stress_csv_path: Optional[str] = None,
+) -> None:
+    """Backward-compatible wrapper for 3D VTK export."""
+    export_vtk_from_csv(
+        mesh=mesh,
+        disp_csv_path=disp_csv_path,
+        elem_csv_path=elem_csv_path,
+        vtk_path=vtk_path,
+        nodal_stress_csv_path=nodal_stress_csv_path,
+    )
 
 
 def extract_path_data(
@@ -1670,6 +1687,85 @@ def export_hex8_nodal_stress_csv(
 # Tet4 (3D tetrahedral) stress computation and export
 # ============================================================
 
+_TET4_CENTROID = (0.25, 0.25, 0.25)
+_TET10_NATURAL_NODE_COORDS = [
+    (0.0, 0.0, 0.0),
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+    (0.5, 0.0, 0.0),
+    (0.5, 0.5, 0.0),
+    (0.0, 0.5, 0.0),
+    (0.0, 0.0, 0.5),
+    (0.5, 0.0, 0.5),
+    (0.0, 0.5, 0.5),
+]
+_TET10_HAMMER_GAUSS_POINTS = [
+    (0.13819660, 0.13819660, 0.13819660, 1.0 / 24.0),
+    (0.58541020, 0.13819660, 0.13819660, 1.0 / 24.0),
+    (0.13819660, 0.58541020, 0.13819660, 1.0 / 24.0),
+    (0.13819660, 0.13819660, 0.58541020, 1.0 / 24.0),
+]
+
+
+def _tet_element_coords(elem, node_lookup: Dict[int, Node3D]):
+    """Return element node coordinates as arrays."""
+    nodes = [node_lookup[nid] for nid in elem.node_ids]
+    x = np.array([n.x for n in nodes], dtype=float)
+    y = np.array([n.y for n in nodes], dtype=float)
+    z = np.array([n.z for n in nodes], dtype=float)
+    return x, y, z
+
+
+def _tet_physical_shape_gradients(
+    elem,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    dN_dxi: np.ndarray,
+    dN_deta: np.ndarray,
+    dN_dzeta: np.ndarray,
+):
+    """Map tetra shape gradients from natural to physical coordinates."""
+    J = np.array([
+        [np.sum(dN_dxi * x), np.sum(dN_dxi * y), np.sum(dN_dxi * z)],
+        [np.sum(dN_deta * x), np.sum(dN_deta * y), np.sum(dN_deta * z)],
+        [np.sum(dN_dzeta * x), np.sum(dN_dzeta * y), np.sum(dN_dzeta * z)],
+    ], dtype=float)
+
+    detJ = float(np.linalg.det(J))
+    if detJ <= 0.0:
+        raise ValueError(f"Element {elem.id} has negative or zero Jacobian determinant")
+
+    invJ = np.linalg.inv(J)
+    dN_dx = invJ[0, 0] * dN_dxi + invJ[0, 1] * dN_deta + invJ[0, 2] * dN_dzeta
+    dN_dy = invJ[1, 0] * dN_dxi + invJ[1, 1] * dN_deta + invJ[1, 2] * dN_dzeta
+    dN_dz = invJ[2, 0] * dN_dxi + invJ[2, 1] * dN_deta + invJ[2, 2] * dN_dzeta
+    return dN_dx, dN_dy, dN_dz, detJ
+
+
+def _tet4_element_volume(elem, node_lookup: Dict[int, Node3D]) -> float:
+    """Return Tet4 element volume."""
+    from .stiffness import _tet4_shape_funcs_grads
+
+    x, y, z = _tet_element_coords(elem, node_lookup)
+    _, dN_dxi, dN_deta, dN_dzeta = _tet4_shape_funcs_grads(*_TET4_CENTROID)
+    _, _, _, detJ = _tet_physical_shape_gradients(elem, x, y, z, dN_dxi, dN_deta, dN_dzeta)
+    return detJ / 6.0
+
+
+def _tet10_element_volume(elem, node_lookup: Dict[int, Node3D]) -> float:
+    """Return Tet10 element volume using the same 4-point rule as stiffness integration."""
+    from .stiffness import _tet10_shape_funcs_grads
+
+    x, y, z = _tet_element_coords(elem, node_lookup)
+    volume = 0.0
+    for xi, eta, zeta, w in _TET10_HAMMER_GAUSS_POINTS:
+        _, dN_dxi, dN_deta, dN_dzeta = _tet10_shape_funcs_grads(xi, eta, zeta)
+        _, _, _, detJ = _tet_physical_shape_gradients(elem, x, y, z, dN_dxi, dN_deta, dN_dzeta)
+        volume += detJ * w
+    return volume
+
 def _compute_tet4_element_stress_at_point(
     mesh: Mesh3DProtocol,
     elem,
@@ -1686,25 +1782,12 @@ def _compute_tet4_element_stress_at_point(
     nu = float(elem.props["nu"])
     D = _compute_D_3d(E, nu)
 
-    nids = elem.node_ids
-    nodes = [node_lookup[nid] for nid in nids]
-    x = np.array([n.x for n in nodes], dtype=float)
-    y = np.array([n.y for n in nodes], dtype=float)
-    z = np.array([n.z for n in nodes], dtype=float)
+    x, y, z = _tet_element_coords(elem, node_lookup)
 
-    N, dN_dxi, dN_deta, dN_dzeta = _tet4_shape_funcs_grads(xi, eta, zeta)
-
-    J = np.array([
-        [np.sum(dN_dxi * x), np.sum(dN_dxi * y), np.sum(dN_dxi * z)],
-        [np.sum(dN_deta * x), np.sum(dN_deta * y), np.sum(dN_deta * z)],
-        [np.sum(dN_dzeta * x), np.sum(dN_dzeta * y), np.sum(dN_dzeta * z)],
-    ], dtype=float)
-
-    invJ = np.linalg.inv(J)
-
-    dN_dx = invJ[0, 0] * dN_dxi + invJ[0, 1] * dN_deta + invJ[0, 2] * dN_dzeta
-    dN_dy = invJ[1, 0] * dN_dxi + invJ[1, 1] * dN_deta + invJ[1, 2] * dN_dzeta
-    dN_dz = invJ[2, 0] * dN_dxi + invJ[2, 1] * dN_deta + invJ[2, 2] * dN_dzeta
+    _, dN_dxi, dN_deta, dN_dzeta = _tet4_shape_funcs_grads(xi, eta, zeta)
+    dN_dx, dN_dy, dN_dz, _ = _tet_physical_shape_gradients(
+        elem, x, y, z, dN_dxi, dN_deta, dN_dzeta
+    )
 
     # B matrix (6 x 12)
     B = np.zeros((6, 12), dtype=float)
@@ -1752,7 +1835,7 @@ def export_tet4_element_stress_csv(
                 continue
 
             stresses = _compute_tet4_element_stress_at_point(
-                mesh, elem, U, node_lookup, 0.25, 0.25, 0.25
+                mesh, elem, U, node_lookup, *_TET4_CENTROID
             )
             sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = stresses
             mises = np.sqrt(
@@ -1790,7 +1873,7 @@ def export_tet4_nodal_stress_csv(
                 continue
 
             stress_sum = np.zeros(6, dtype=float)
-            count = 0
+            weight_sum = 0.0
 
             for elem in connected_elems:
                 et = str(elem.type).lower()
@@ -1798,16 +1881,17 @@ def export_tet4_nodal_stress_csv(
                     continue
                 # For Tet4, stress is constant throughout the element (linear tet)
                 stress = _compute_tet4_element_stress_at_point(
-                    mesh, elem, U, node_lookup, 0.25, 0.25, 0.25
+                    mesh, elem, U, node_lookup, *_TET4_CENTROID
                 )
-                stress_sum += np.array(stress)
-                count += 1
+                weight = _tet4_element_volume(elem, node_lookup)
+                stress_sum += weight * np.asarray(stress, dtype=float)
+                weight_sum += weight
 
-            if count == 0:
+            if weight_sum == 0.0:
                 writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
                 continue
 
-            avg = stress_sum / count
+            avg = stress_sum / weight_sum
             sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = avg
             mises = np.sqrt(
                 0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2)
@@ -1832,25 +1916,12 @@ def _compute_tet10_element_stress_at_point(
     nu = float(elem.props["nu"])
     D = _compute_D_3d(E, nu)
 
-    nids = elem.node_ids
-    nodes = [node_lookup[nid] for nid in nids]
-    x = np.array([n.x for n in nodes], dtype=float)
-    y = np.array([n.y for n in nodes], dtype=float)
-    z = np.array([n.z for n in nodes], dtype=float)
+    x, y, z = _tet_element_coords(elem, node_lookup)
 
-    N, dN_dxi, dN_deta, dN_dzeta = _tet10_shape_funcs_grads(xi, eta, zeta)
-
-    J = np.array([
-        [np.sum(dN_dxi * x), np.sum(dN_dxi * y), np.sum(dN_dxi * z)],
-        [np.sum(dN_deta * x), np.sum(dN_deta * y), np.sum(dN_deta * z)],
-        [np.sum(dN_dzeta * x), np.sum(dN_dzeta * y), np.sum(dN_dzeta * z)],
-    ], dtype=float)
-
-    invJ = np.linalg.inv(J)
-
-    dN_dx = invJ[0, 0] * dN_dxi + invJ[0, 1] * dN_deta + invJ[0, 2] * dN_dzeta
-    dN_dy = invJ[1, 0] * dN_dxi + invJ[1, 1] * dN_deta + invJ[1, 2] * dN_dzeta
-    dN_dz = invJ[2, 0] * dN_dxi + invJ[2, 1] * dN_deta + invJ[2, 2] * dN_dzeta
+    _, dN_dxi, dN_deta, dN_dzeta = _tet10_shape_funcs_grads(xi, eta, zeta)
+    dN_dx, dN_dy, dN_dz, _ = _tet_physical_shape_gradients(
+        elem, x, y, z, dN_dxi, dN_deta, dN_dzeta
+    )
 
     # B matrix (6 x 30)
     B = np.zeros((6, 30), dtype=float)
@@ -1898,7 +1969,7 @@ def export_tet10_element_stress_csv(
                 continue
 
             stresses = _compute_tet10_element_stress_at_point(
-                mesh, elem, U, node_lookup, 0.25, 0.25, 0.25
+                mesh, elem, U, node_lookup, *_TET4_CENTROID
             )
             sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = stresses
             mises = np.sqrt(
@@ -1920,12 +1991,6 @@ def export_tet10_nodal_stress_csv(
 
     node_lookup = {node.id: node for node in mesh.nodes}
 
-    # 4-point Hammer integration for stress sampling
-    n = 0.58541020
-    a = (1.0 - n) / 4.0
-    b = (1.0 + 3.0 * n) / 4.0
-    gps = [(a, a, a), (b, a, a), (a, b, a), (a, a, b)]
-
     header = ["node_id", "x", "y", "z", "sig_x", "sig_y", "sig_z", "tau_xy", "tau_yz", "tau_zx", "mises"]
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1942,28 +2007,26 @@ def export_tet10_nodal_stress_csv(
                 continue
 
             stress_sum = np.zeros(6, dtype=float)
-            count = 0
+            weight_sum = 0.0
 
             for elem in connected_elems:
                 et = str(elem.type).lower()
                 if "tet10" not in et:
                     continue
-                # Average stress from 4 Gauss points
-                gp_stresses = []
-                for xi, eta, zeta in gps:
-                    stress = _compute_tet10_element_stress_at_point(
-                        mesh, elem, U, node_lookup, xi, eta, zeta
-                    )
-                    gp_stresses.append(stress)
-                elem_stress = np.mean(gp_stresses, axis=0)
-                stress_sum += elem_stress
-                count += 1
+                local_idx = elem.node_ids.index(nid)
+                xi, eta, zeta = _TET10_NATURAL_NODE_COORDS[local_idx]
+                stress = _compute_tet10_element_stress_at_point(
+                    mesh, elem, U, node_lookup, xi, eta, zeta
+                )
+                weight = _tet10_element_volume(elem, node_lookup)
+                stress_sum += weight * np.asarray(stress, dtype=float)
+                weight_sum += weight
 
-            if count == 0:
+            if weight_sum == 0.0:
                 writer.writerow([nid, node.x, node.y, node.z, 0, 0, 0, 0, 0, 0, 0])
                 continue
 
-            avg = stress_sum / count
+            avg = stress_sum / weight_sum
             sig_x, sig_y, sig_z, tau_xy, tau_yz, tau_zx = avg
             mises = np.sqrt(
                 0.5 * ((sig_x - sig_y)**2 + (sig_y - sig_z)**2 + (sig_z - sig_x)**2)

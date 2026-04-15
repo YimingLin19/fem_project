@@ -578,17 +578,17 @@ def _tet10_shape_funcs_grads(xi: float, eta: float, zeta: float):
 
     Node ordering (Abaqus convention):
         Corner nodes:  1=(0,0,0), 2=(1,0,0), 3=(0,1,0), 4=(0,0,1)
-        Edge midnodes: 5=(.5,.5,0), 6=(0,.5,.5), 7=(0,0,.5),
-                       8=(.5,0,0), 9=(.5,0,.5), 10=(0,.5,0)
+        Edge midnodes: 5=edge(1,2), 6=edge(2,3), 7=edge(3,1),
+                       8=edge(1,4), 9=edge(2,4), 10=edge(3,4)
 
     Shape functions (natural coords L1=1-xi-eta-zeta, L2=xi, L3=eta, L4=zeta):
         N_corner_i = (2*L_i - 1) * L_i
         N_edge_5  = 4*L1*L2   (edge 1-2)
-        N_edge_6  = 4*L3*L4   (edge 3-4)
-        N_edge_7  = 4*L1*L4   (edge 1-4)
-        N_edge_8  = 4*L1*L3   (edge 1-3)
+        N_edge_6  = 4*L2*L3   (edge 2-3)
+        N_edge_7  = 4*L1*L3   (edge 3-1)
+        N_edge_8  = 4*L1*L4   (edge 1-4)
         N_edge_9  = 4*L2*L4   (edge 2-4)
-        N_edge_10 = 4*L2*L3   (edge 2-3)
+        N_edge_10 = 4*L3*L4   (edge 3-4)
     """
     L1 = 1.0 - xi - eta - zeta
     L2 = xi
@@ -608,11 +608,11 @@ def _tet10_shape_funcs_grads(xi: float, eta: float, zeta: float):
 
     # Edge midnodes
     N[4] = 4.0 * L1 * L2   # edge 1-2
-    N[5] = 4.0 * L3 * L4   # edge 3-4
-    N[6] = 4.0 * L1 * L4   # edge 1-4
-    N[7] = 4.0 * L1 * L3   # edge 1-3
+    N[5] = 4.0 * L2 * L3   # edge 2-3
+    N[6] = 4.0 * L1 * L3   # edge 3-1
+    N[7] = 4.0 * L1 * L4   # edge 1-4
     N[8] = 4.0 * L2 * L4   # edge 2-4
-    N[9] = 4.0 * L2 * L3   # edge 2-3
+    N[9] = 4.0 * L3 * L4   # edge 3-4
 
     # Derivatives of volume coordinates
     dL1_dxi = -1.0; dL1_deta = -1.0; dL1_dzeta = -1.0
@@ -643,30 +643,30 @@ def _tet10_shape_funcs_grads(xi: float, eta: float, zeta: float):
     dN_deta[4]  = 4.0 * (L2 * dL1_deta + L1 * dL2_deta)
     dN_dzeta[4] = 4.0 * (L2 * dL1_dzeta + L1 * dL2_dzeta)
 
-    # Edge 6: 4*L3*L4
-    dN_dxi[5]   = 4.0 * (L4 * dL3_dxi + L3 * dL4_dxi)
-    dN_deta[5]  = 4.0 * (L4 * dL3_deta + L3 * dL4_deta)
-    dN_dzeta[5] = 4.0 * (L4 * dL3_dzeta + L3 * dL4_dzeta)
+    # Edge 6: 4*L2*L3
+    dN_dxi[5]   = 4.0 * (L3 * dL2_dxi + L2 * dL3_dxi)
+    dN_deta[5]  = 4.0 * (L3 * dL2_deta + L2 * dL3_deta)
+    dN_dzeta[5] = 4.0 * (L3 * dL2_dzeta + L2 * dL3_dzeta)
 
-    # Edge 7: 4*L1*L4
-    dN_dxi[6]   = 4.0 * (L4 * dL1_dxi + L1 * dL4_dxi)
-    dN_deta[6]  = 4.0 * (L4 * dL1_deta + L1 * dL4_deta)
-    dN_dzeta[6] = 4.0 * (L4 * dL1_dzeta + L1 * dL4_dzeta)
+    # Edge 7: 4*L1*L3
+    dN_dxi[6]   = 4.0 * (L3 * dL1_dxi + L1 * dL3_dxi)
+    dN_deta[6]  = 4.0 * (L3 * dL1_deta + L1 * dL3_deta)
+    dN_dzeta[6] = 4.0 * (L3 * dL1_dzeta + L1 * dL3_dzeta)
 
-    # Edge 8: 4*L1*L3
-    dN_dxi[7]   = 4.0 * (L3 * dL1_dxi + L1 * dL3_dxi)
-    dN_deta[7]  = 4.0 * (L3 * dL1_deta + L1 * dL3_deta)
-    dN_dzeta[7] = 4.0 * (L3 * dL1_dzeta + L1 * dL3_dzeta)
+    # Edge 8: 4*L1*L4
+    dN_dxi[7]   = 4.0 * (L4 * dL1_dxi + L1 * dL4_dxi)
+    dN_deta[7]  = 4.0 * (L4 * dL1_deta + L1 * dL4_deta)
+    dN_dzeta[7] = 4.0 * (L4 * dL1_dzeta + L1 * dL4_dzeta)
 
     # Edge 9: 4*L2*L4
     dN_dxi[8]   = 4.0 * (L4 * dL2_dxi + L2 * dL4_dxi)
     dN_deta[8]  = 4.0 * (L4 * dL2_deta + L2 * dL4_deta)
     dN_dzeta[8] = 4.0 * (L4 * dL2_dzeta + L2 * dL4_dzeta)
 
-    # Edge 10: 4*L2*L3
-    dN_dxi[9]   = 4.0 * (L3 * dL2_dxi + L2 * dL3_dxi)
-    dN_deta[9]  = 4.0 * (L3 * dL2_deta + L2 * dL3_deta)
-    dN_dzeta[9] = 4.0 * (L3 * dL2_dzeta + L2 * dL3_dzeta)
+    # Edge 10: 4*L3*L4
+    dN_dxi[9]   = 4.0 * (L4 * dL3_dxi + L3 * dL4_dxi)
+    dN_deta[9]  = 4.0 * (L4 * dL3_deta + L3 * dL4_deta)
+    dN_dzeta[9] = 4.0 * (L4 * dL3_dzeta + L3 * dL4_dzeta)
 
     return N, dN_dxi, dN_deta, dN_dzeta
 

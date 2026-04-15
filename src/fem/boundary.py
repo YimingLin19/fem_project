@@ -236,6 +236,12 @@ def _add_element_body_force_consistent_3d(mesh: Any, elem: Any, node_lookup: Dic
         dofs = mesh.element_dofs(elem)
         F[dofs] += fe
 
+    elif "tet10" in et:
+        raise NotImplementedError("Tet10 consistent body-force assembly is not implemented")
+
+    else:
+        raise NotImplementedError(f"Unsupported 3D element type for body force assembly: {elem.type}")
+
 
 def _add_element_face_traction_consistent_3d(mesh: Any, elem: Any, node_lookup: Dict[int, Any], F: np.ndarray, local_face: int, tx: float, ty: float, tz: float) -> None:
     """Assemble consistent face traction for Hex8/Tet4."""
@@ -338,6 +344,12 @@ def _add_element_face_traction_consistent_3d(mesh: Any, elem: Any, node_lookup: 
 
         dofs = mesh.element_dofs(elem)
         F[dofs] += fe
+
+    elif "tet10" in et:
+        raise NotImplementedError("Tet10 consistent face-traction assembly is not implemented")
+
+    else:
+        raise NotImplementedError(f"Unsupported 3D element type for face traction assembly: {elem.type}")
 
 
 def apply_dirichlet_bc(K: csr_matrix, F: np.ndarray, bc: BoundaryCondition2D) -> Tuple[csr_matrix, np.ndarray]:

@@ -832,7 +832,7 @@ def read_tet10_3d_abaqus(
                         if p.startswith("TYPE="):
                             et = p.split("=", 1)[1].strip()
                             break
-                    if et in ("C3D10", "C3D10M", "C3D10T"):
+                    if et in ("C3D10", "C3D10T"):
                         in_elem = True
                         elem_abaqus_type = et
                 else:
@@ -1099,7 +1099,7 @@ def read_tet4_3d_abaqus(
         v1 = np.array([n2.x - n1.x, n2.y - n1.y, n2.z - n1.z])
         v2 = np.array([n3.x - n1.x, n3.y - n1.y, n3.z - n1.z])
         v3 = np.array([n4.x - n1.x, n4.y - n1.y, n4.z - n1.z])
-        vol = abs(np.dot(v1, np.cross(v2, v3))) / 6.0
+        vol = np.dot(v1, np.cross(v2, v3)) / 6.0
         if vol <= 0.0:
             raise ValueError(
                 f"Element {e.id} has zero or negative volume "
@@ -1151,7 +1151,7 @@ def read_hex8_3d_abaqus(
                         if p.startswith("TYPE="):
                             et = p.split("=", 1)[1].strip()
                             break
-                    if et in ("C3D8", "C3D8R", "C3D8I"):
+                    if et == "C3D8":
                         in_elem = True
                         elem_abaqus_type = et
                 else:
