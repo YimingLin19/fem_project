@@ -1402,7 +1402,7 @@ class AbaqusModelReaderTests(unittest.TestCase):
                     "*Elset, elset=SOLID",
                     "1",
                     "*Surface, type=ELEMENT, name=TIP_FACE",
-                    "SOLID, S6",
+                    "SOLID, S4",
                     "*Material, name=STEEL",
                     "*Density",
                     "7.85",
@@ -1517,7 +1517,7 @@ class AbaqusModelReaderTests(unittest.TestCase):
                     "*Elset, elset=SOLID",
                     "1",
                     "*Surface, type=ELEMENT, name=TIP_FACE",
-                    "SOLID, S6",
+                    "SOLID, S4",
                     "*Material, name=STEEL",
                     "*Elastic",
                     "210., 0.3",
@@ -1527,7 +1527,7 @@ class AbaqusModelReaderTests(unittest.TestCase):
                     "*Dsload",
                     "TIP_FACE, P, 2.",
                     "*Dload",
-                    "SOLID, P6, 3.",
+                    "SOLID, P4, 3.",
                     "*End Step",
                 ]
             ),
@@ -1544,6 +1544,256 @@ class AbaqusModelReaderTests(unittest.TestCase):
         self.assertEqual(len(bc.surface_tractions), 2)
         self.assertTrue(np.allclose(bc.surface_tractions[0].vector, (-2.0, 0.0, 0.0)))
         self.assertTrue(np.allclose(bc.surface_tractions[1].vector, (-3.0, 0.0, 0.0)))
+
+    def test_abaqus_read_maps_tetra_face_labels_to_local_faces(self):
+        from fem import abaqus
+
+        path = Path("results") / "test_abaqus_tet_face_labels.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 0., 1., 0.",
+                    "4, 0., 0., 1.",
+                    "*Element, type=C3D4, elset=SOLID",
+                    "1, 1,2,3,4",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Surface, type=ELEMENT, name=FACE_1",
+                    "SOLID, S1",
+                    "*Surface, type=ELEMENT, name=FACE_2",
+                    "SOLID, S2",
+                    "*Surface, type=ELEMENT, name=FACE_3",
+                    "SOLID, S3",
+                    "*Surface, type=ELEMENT, name=FACE_4",
+                    "SOLID, S4",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+
+        self.assertEqual(model.surfaces["FACE_1"].faces[0], ElementFace(1, 3, (1, 2, 3)))
+        self.assertEqual(model.surfaces["FACE_2"].faces[0], ElementFace(1, 2, (1, 2, 4)))
+        self.assertEqual(model.surfaces["FACE_3"].faces[0], ElementFace(1, 0, (2, 3, 4)))
+        self.assertEqual(model.surfaces["FACE_4"].faces[0], ElementFace(1, 1, (1, 3, 4)))
+
+    def test_abaqus_read_maps_hex_face_labels_to_local_faces(self):
+        from fem import abaqus
+
+        path = Path("results") / "test_abaqus_hex_face_labels.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 1., 1., 0.",
+                    "4, 0., 1., 0.",
+                    "5, 0., 0., 1.",
+                    "6, 1., 0., 1.",
+                    "7, 1., 1., 1.",
+                    "8, 0., 1., 1.",
+                    "*Element, type=C3D8, elset=SOLID",
+                    "1, 1,2,3,4,5,6,7,8",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Surface, type=ELEMENT, name=FACE_1",
+                    "SOLID, S1",
+                    "*Surface, type=ELEMENT, name=FACE_2",
+                    "SOLID, S2",
+                    "*Surface, type=ELEMENT, name=FACE_3",
+                    "SOLID, S3",
+                    "*Surface, type=ELEMENT, name=FACE_4",
+                    "SOLID, S4",
+                    "*Surface, type=ELEMENT, name=FACE_5",
+                    "SOLID, S5",
+                    "*Surface, type=ELEMENT, name=FACE_6",
+                    "SOLID, S6",
+                    "*Surface, type=ELEMENT, name=LOADED",
+                    "SOLID, S1",
+                    "SOLID, S2",
+                    "SOLID, S3",
+                    "SOLID, S4",
+                    "SOLID, S5",
+                    "SOLID, S6",
+                    "*Step, name=LOAD",
+                    "*Static",
+                    "*Dsload",
+                    "LOADED, P, 2.",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+
+        self.assertEqual(model.surfaces["FACE_1"].faces[0], ElementFace(1, 0, (1, 4, 3, 2)))
+        self.assertEqual(model.surfaces["FACE_2"].faces[0], ElementFace(1, 1, (5, 6, 7, 8)))
+        self.assertEqual(model.surfaces["FACE_3"].faces[0], ElementFace(1, 2, (1, 2, 6, 5)))
+        self.assertEqual(model.surfaces["FACE_4"].faces[0], ElementFace(1, 5, (2, 3, 7, 6)))
+        self.assertEqual(model.surfaces["FACE_5"].faces[0], ElementFace(1, 3, (3, 4, 8, 7)))
+        self.assertEqual(model.surfaces["FACE_6"].faces[0], ElementFace(1, 4, (1, 5, 8, 4)))
+
+        from fem.solvers import static_linear
+
+        bc = static_linear.boundary_for_step(model, "LOAD")
+        node_lookup = {node.id: node for node in model.mesh.nodes}
+        elem = model.mesh.elements[0]
+        elem_xyz = np.array(
+            [[node_lookup[node_id].x, node_lookup[node_id].y, node_lookup[node_id].z]
+             for node_id in elem.node_ids],
+            dtype=float,
+        )
+        elem_center = elem_xyz.mean(axis=0)
+
+        for face, traction in zip(model.surfaces["LOADED"].faces, bc.surface_tractions):
+            face_xyz = np.array(
+                [[node_lookup[node_id].x, node_lookup[node_id].y, node_lookup[node_id].z]
+                 for node_id in face.node_ids],
+                dtype=float,
+            )
+            inward = elem_center - face_xyz.mean(axis=0)
+
+            self.assertGreater(np.dot(np.array(traction.vector), inward), 0.0)
+
+    def test_abaqus_read_maps_tet10_face_labels_and_pressure_direction(self):
+        from fem import abaqus
+        from fem.solvers import static_linear
+
+        path = Path("results") / "test_abaqus_tet10_face_labels.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 0., 1., 0.",
+                    "4, 0., 0., 1.",
+                    "5, 0.5, 0., 0.",
+                    "6, 0.5, 0.5, 0.",
+                    "7, 0., 0.5, 0.",
+                    "8, 0., 0., 0.5",
+                    "9, 0.5, 0., 0.5",
+                    "10, 0., 0.5, 0.5",
+                    "*Element, type=C3D10, elset=SOLID",
+                    "1, 1,2,3,4,5,6,7,8,9,10",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Surface, type=ELEMENT, name=FACE_1",
+                    "SOLID, S1",
+                    "*Surface, type=ELEMENT, name=FACE_2",
+                    "SOLID, S2",
+                    "*Surface, type=ELEMENT, name=FACE_3",
+                    "SOLID, S3",
+                    "*Surface, type=ELEMENT, name=FACE_4",
+                    "SOLID, S4",
+                    "*Surface, type=ELEMENT, name=LOADED",
+                    "SOLID, S1",
+                    "SOLID, S2",
+                    "SOLID, S3",
+                    "SOLID, S4",
+                    "*Step, name=LOAD",
+                    "*Static",
+                    "*Dsload",
+                    "LOADED, P, 2.",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+
+        self.assertEqual(model.surfaces["FACE_1"].faces[0], ElementFace(1, 3, (1, 2, 3, 5, 6, 7)))
+        self.assertEqual(model.surfaces["FACE_2"].faces[0], ElementFace(1, 2, (1, 2, 4, 5, 9, 8)))
+        self.assertEqual(model.surfaces["FACE_3"].faces[0], ElementFace(1, 0, (2, 3, 4, 6, 10, 9)))
+        self.assertEqual(model.surfaces["FACE_4"].faces[0], ElementFace(1, 1, (1, 3, 4, 7, 10, 8)))
+
+        bc = static_linear.boundary_for_step(model, "LOAD")
+        node_lookup = {node.id: node for node in model.mesh.nodes}
+        elem = model.mesh.elements[0]
+        elem_xyz = np.array(
+            [[node_lookup[node_id].x, node_lookup[node_id].y, node_lookup[node_id].z]
+             for node_id in elem.node_ids],
+            dtype=float,
+        )
+        elem_center = elem_xyz.mean(axis=0)
+
+        for face, traction in zip(model.surfaces["LOADED"].faces, bc.surface_tractions):
+            face_xyz = np.array(
+                [[node_lookup[node_id].x, node_lookup[node_id].y, node_lookup[node_id].z]
+                 for node_id in face.node_ids],
+                dtype=float,
+            )
+            inward = elem_center - face_xyz.mean(axis=0)
+
+            self.assertGreater(np.dot(np.array(traction.vector), inward), 0.0)
+
+    def test_abaqus_pressure_points_into_tetra_element_for_all_faces(self):
+        from fem import abaqus
+        from fem.solvers import static_linear
+
+        path = Path("results") / "test_abaqus_tet_pressure_direction.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 0., 1., 0.",
+                    "4, 0., 0., 1.",
+                    "*Element, type=C3D4, elset=SOLID",
+                    "1, 1,2,3,4",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Surface, type=ELEMENT, name=LOADED",
+                    "SOLID, S1",
+                    "SOLID, S2",
+                    "SOLID, S3",
+                    "SOLID, S4",
+                    "*Material, name=STEEL",
+                    "*Elastic",
+                    "210., 0.3",
+                    "*Solid Section, elset=SOLID, material=STEEL",
+                    "*Step, name=LOAD",
+                    "*Static",
+                    "*Dsload",
+                    "LOADED, P, 2.",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+        bc = static_linear.boundary_for_step(model, "LOAD")
+        node_lookup = {node.id: node for node in model.mesh.nodes}
+        elem = model.mesh.elements[0]
+        elem_xyz = np.array(
+            [[node_lookup[node_id].x, node_lookup[node_id].y, node_lookup[node_id].z]
+             for node_id in elem.node_ids],
+            dtype=float,
+        )
+        elem_center = elem_xyz.mean(axis=0)
+
+        for face, traction in zip(model.surfaces["LOADED"].faces, bc.surface_tractions):
+            face_xyz = np.array(
+                [[node_lookup[node_id].x, node_lookup[node_id].y, node_lookup[node_id].z]
+                 for node_id in face.node_ids],
+                dtype=float,
+            )
+            inward = elem_center - face_xyz.mean(axis=0)
+
+            self.assertGreater(np.dot(np.array(traction.vector), inward), 0.0)
 
     def test_abaqus_read_accumulates_repeated_sets_and_scales_trvec_loads(self):
         from fem import abaqus

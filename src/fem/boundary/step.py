@@ -115,7 +115,22 @@ def _pressure_vector(
     norm = float(np.linalg.norm(normal))
     if norm <= 0.0:
         raise ValueError(f"surface face {face} has zero normal")
-    return tuple(float(value) for value in -surface_load.magnitude * normal / norm)
+
+    elem_lookup = {elem.id: elem for elem in model.mesh.elements}
+    elem = elem_lookup.get(face.elem_id)
+    if elem is None:
+        raise KeyError(f"element {face.elem_id} is not defined")
+    elem_coords = []
+    for node_id in elem.node_ids:
+        node = node_lookup[node_id]
+        elem_coords.append([float(node.x), float(node.y), float(getattr(node, "z", 0.0))])
+    face_center = np.mean(np.array(coords, dtype=float), axis=0)
+    elem_center = np.mean(np.array(elem_coords, dtype=float), axis=0)
+    inward = elem_center - face_center
+    if float(np.dot(normal, inward)) < 0.0:
+        normal = -normal
+
+    return tuple(float(value) for value in surface_load.magnitude * normal / norm)
 
 
 def _validate_component(model: Any, component: int) -> None:

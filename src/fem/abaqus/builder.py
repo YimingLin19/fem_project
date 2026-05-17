@@ -111,13 +111,15 @@ def _build_surfaces(
         (elem_id, local_index): node_ids
         for elem_id, local_index, node_ids in face_selection.all(mesh)
     }
+    elem_lookup = {elem.id: elem for elem in mesh.elements}
     surfaces: dict[str, Surface] = {}
 
     for name, entries in deck.surfaces.items():
         model_faces: list[ElementFace] = []
         for entry in entries:
-            local_index = _face_label_to_index(entry.face_label)
             for element_id in _resolve_element_target(entry.target, element_sets):
+                elem = _require_mesh_element(elem_lookup, element_id)
+                local_index = _face_label_to_index(entry.face_label, elem.type)
                 node_ids = face_lookup.get((element_id, local_index))
                 if node_ids is None:
                     raise ValueError(
@@ -210,13 +212,15 @@ def _surface_from_element_target(
     element_sets: dict[str, ElementSet],
 ) -> Surface:
     """Build a generated surface from an element target and face label."""
-    local_index = _face_label_to_index(face_label)
     face_lookup = {
         (elem_id, face_index): node_ids
         for elem_id, face_index, node_ids in face_selection.all(mesh)
     }
+    elem_lookup = {elem.id: elem for elem in mesh.elements}
     model_faces = []
     for element_id in _resolve_element_target(target, element_sets):
+        elem = _require_mesh_element(elem_lookup, element_id)
+        local_index = _face_label_to_index(face_label, elem.type)
         node_ids = face_lookup.get((element_id, local_index))
         if node_ids is None:
             raise ValueError(f"element {element_id} does not have Abaqus face {face_label}")
@@ -318,12 +322,46 @@ def _resolve_element_target(
     return element_sets[target].element_ids
 
 
-def _face_label_to_index(face_label: str) -> int:
-    """Convert Abaqus S1-style labels to 0-based local face index."""
+def _face_label_to_index(face_label: str, element_type: str | None = None) -> int:
+    """Convert Abaqus S1-style labels to the project's local face index."""
     label = face_label.strip().upper()
     if not label.startswith("S"):
         raise ValueError(f"unsupported Abaqus face label: {face_label}")
-    return int(label[1:]) - 1
+    face_number = int(label[1:])
+    if element_type is None:
+        return face_number - 1
+
+    etype = element_type.upper()
+    if "TET" in etype or etype.startswith("C3D4") or etype.startswith("C3D10"):
+        return _mapped_face_index(face_number, {1: 3, 2: 2, 3: 0, 4: 1}, face_label, element_type)
+    if "HEX8" in etype or etype.startswith("C3D8"):
+        return _mapped_face_index(
+            face_number,
+            {1: 0, 2: 1, 3: 2, 4: 5, 5: 3, 6: 4},
+            face_label,
+            element_type,
+        )
+    return face_number - 1
+
+
+def _mapped_face_index(
+    face_number: int,
+    mapping: dict[int, int],
+    face_label: str,
+    element_type: str,
+) -> int:
+    """Return a mapped local face index or raise a descriptive error."""
+    if face_number not in mapping:
+        raise ValueError(f"element type {element_type} does not have Abaqus face {face_label}")
+    return mapping[face_number]
+
+
+def _require_mesh_element(elem_lookup: dict[int, Any], element_id: int) -> Any:
+    """Return a mesh element by id."""
+    elem = elem_lookup.get(element_id)
+    if elem is None:
+        raise KeyError(f"element {element_id} is not defined")
+    return elem
 
 
 def _dload_face_label(load_label: str) -> str:
