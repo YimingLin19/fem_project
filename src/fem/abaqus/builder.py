@@ -204,6 +204,13 @@ def _build_surface_load(
         return SurfaceLoad(surface_name, magnitude=load.magnitude, load_type="pressure")
     if label == "TRVEC":
         return SurfaceLoad(surface_name, _scaled_traction_vector(load, mesh), load_type="traction")
+    if label == "TRSHR":
+        return SurfaceLoad(
+            surface_name,
+            _traction_direction(load, mesh, "TRSHR"),
+            magnitude=load.magnitude,
+            load_type="shear_traction",
+        )
     raise ValueError(f"unsupported Abaqus distributed load label: {load.label}")
 
 
@@ -233,12 +240,25 @@ def _surface_from_element_target(
 
 def _scaled_traction_vector(load: AbaqusDistributedLoad, mesh: Any) -> tuple[float, ...]:
     """Return TRVEC magnitude multiplied by its direction vector."""
+    direction = _traction_direction(load, mesh, "TRVEC")
+    return tuple(float(load.magnitude * value) for value in direction)
+
+
+def _traction_direction(
+    load: AbaqusDistributedLoad,
+    mesh: Any,
+    label: str,
+) -> tuple[float, ...]:
+    """Return a normalized Abaqus traction direction vector."""
     dim = 3 if mesh.nodes and hasattr(mesh.nodes[0], "z") else 2
     if len(load.extra) != dim:
         raise ValueError(
-            f"TRVEC requires {dim} direction components, got {len(load.extra)}"
+            f"{label} requires {dim} direction components, got {len(load.extra)}"
         )
-    return tuple(float(load.magnitude * value) for value in load.extra)
+    norm = sum(float(value) ** 2 for value in load.extra) ** 0.5
+    if norm <= 0.0:
+        raise ValueError(f"{label} direction vector must be nonzero")
+    return tuple(float(value) / norm for value in load.extra)
 
 
 def _mesh_dimension(elements: list[AbaqusElement]) -> int:

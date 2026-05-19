@@ -1599,6 +1599,88 @@ class AbaqusModelReaderTests(unittest.TestCase):
         self.assertTrue(np.allclose(bc.surface_tractions[0].vector, (-2.0, 0.0, 0.0)))
         self.assertTrue(np.allclose(bc.surface_tractions[1].vector, (-3.0, 0.0, 0.0)))
 
+    def test_abaqus_read_projects_trshr_direction_to_surface_tangent(self):
+        from fem import abaqus
+
+        path = Path("results") / "test_abaqus_trshr_surface_load.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 1., 1., 0.",
+                    "4, 0., 1., 0.",
+                    "5, 0., 0., 1.",
+                    "6, 1., 0., 1.",
+                    "7, 1., 1., 1.",
+                    "8, 0., 1., 1.",
+                    "*Element, type=C3D8, elset=SOLID",
+                    "1, 1,2,3,4,5,6,7,8",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Surface, type=ELEMENT, name=TOP",
+                    "SOLID, S2",
+                    "*Step, name=LOAD",
+                    "*Static",
+                    "*Dsload",
+                    "TOP, TRSHR, 10., 2., 0., 2.",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+        from fem.solvers import static_linear
+
+        bc = static_linear.boundary_for_step(model, "LOAD")
+
+        self.assertEqual(len(model.steps[0].surface_loads), 1)
+        self.assertEqual(model.steps[0].surface_loads[0].load_type, "shear_traction")
+        self.assertEqual(len(bc.surface_tractions), 1)
+        self.assertTrue(np.allclose(bc.surface_tractions[0].vector, (10.0, 0.0, 0.0)))
+
+    def test_abaqus_trshr_rejects_nonplanar_faces(self):
+        from fem import abaqus
+
+        path = Path("results") / "test_abaqus_trshr_nonplanar_face.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 1., 1., 0.",
+                    "4, 0., 1., 0.",
+                    "5, 0., 0., 1.",
+                    "6, 1., 0., 1.",
+                    "7, 1., 1., 1.2",
+                    "8, 0., 1., 1.",
+                    "*Element, type=C3D8, elset=SOLID",
+                    "1, 1,2,3,4,5,6,7,8",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Surface, type=ELEMENT, name=WARPED_TOP",
+                    "SOLID, S2",
+                    "*Step, name=LOAD",
+                    "*Static",
+                    "*Dsload",
+                    "WARPED_TOP, TRSHR, 10., 1., 0., 0.",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+        from fem.solvers import static_linear
+
+        with self.assertRaisesRegex(ValueError, "non-planar"):
+            static_linear.boundary_for_step(model, "LOAD")
+
     def test_abaqus_read_maps_tetra_face_labels_to_local_faces(self):
         from fem import abaqus
 
@@ -1883,7 +1965,7 @@ class AbaqusModelReaderTests(unittest.TestCase):
                     "*Step, name=LOAD",
                     "*Static",
                     "*Dsload",
-                    "TIP_FACE, TRVEC, 10., 0., 0., -1.",
+                    "TIP_FACE, TRVEC, 10., 0., 0., -2.",
                     "*End Step",
                 ]
             ),

@@ -64,6 +64,8 @@ def boundary_for_step(model: Any, step: str | int | AnalysisStep | None = None) 
                 vector = _pressure_vector(model, face, surface_load)
             elif surface_load.load_type == "traction":
                 vector = surface_load.vector
+            elif surface_load.load_type == "shear_traction":
+                vector = _shear_traction_vector(model, face, surface_load)
             else:
                 raise ValueError(f"unsupported surface load type: {surface_load.load_type}")
             boundary.add_surface_traction(face.elem_id, face.local_index, *vector)
@@ -131,6 +133,62 @@ def _pressure_vector(
         normal = -normal
 
     return tuple(float(value) for value in surface_load.magnitude * normal / norm)
+
+
+def _shear_traction_vector(
+    model: Any,
+    face: ElementFace,
+    surface_load: SurfaceLoad,
+) -> tuple[float, ...]:
+    """Return a surface shear traction projected onto one face tangent plane."""
+    if surface_load.magnitude is None:
+        raise ValueError("shear traction surface load requires a magnitude")
+    if not surface_load.vector:
+        raise ValueError("shear traction surface load requires a direction vector")
+
+    normal = _face_unit_normal(model, face)
+    direction = np.array(surface_load.vector, dtype=float)
+    if direction.shape[0] != normal.shape[0]:
+        raise ValueError(
+            f"shear traction direction must have {normal.shape[0]} components, "
+            f"got {direction.shape[0]}"
+        )
+    tangent = direction - float(np.dot(direction, normal)) * normal
+    norm = float(np.linalg.norm(tangent))
+    if norm <= 1e-12:
+        return tuple(0.0 for _ in range(normal.shape[0]))
+    vector = surface_load.magnitude * tangent / norm
+    return tuple(float(value) for value in vector)
+
+
+def _face_unit_normal(model: Any, face: ElementFace) -> np.ndarray:
+    """Return a unit normal for a 3D surface face."""
+    node_lookup = {node.id: node for node in model.mesh.nodes}
+    coords = []
+    for node_id in face.node_ids:
+        node = node_lookup[node_id]
+        coords.append([float(node.x), float(node.y), float(getattr(node, "z", 0.0))])
+    if len(coords) < 3:
+        raise ValueError(f"surface face {face} must contain at least 3 nodes for normal")
+
+    p0 = np.array(coords[0], dtype=float)
+    p1 = np.array(coords[1], dtype=float)
+    p2 = np.array(coords[2], dtype=float)
+    normal = np.cross(p1 - p0, p2 - p0)
+    norm = float(np.linalg.norm(normal))
+    if norm <= 0.0:
+        raise ValueError(f"surface face {face} has zero normal")
+    unit_normal = normal / norm
+    max_span = max(float(np.linalg.norm(np.array(coord, dtype=float) - p0)) for coord in coords)
+    tolerance = 1e-8 * max(max_span, 1.0)
+    for coord in coords[3:]:
+        distance = abs(float(np.dot(np.array(coord, dtype=float) - p0, unit_normal)))
+        if distance > tolerance:
+            raise ValueError(
+                f"surface face {face} is non-planar; "
+                "TRSHR shear traction requires a planar face"
+            )
+    return unit_normal
 
 
 def _validate_component(model: Any, component: int) -> None:
