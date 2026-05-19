@@ -27,6 +27,7 @@ def build_model(deck: AbaqusDeck) -> FEMModel:
     node_sets = {
         name: NodeSet(name, _unique_ids(ids))
         for name, ids in deck.node_sets.items()
+        if deck.node_set_scopes.get(name, "model") != "part"
     }
     element_sets = {
         name: ElementSet(name, _unique_ids(ids))
@@ -115,6 +116,8 @@ def _build_surfaces(
     surfaces: dict[str, Surface] = {}
 
     for name, entries in deck.surfaces.items():
+        if deck.surface_scopes.get(name, "model") == "part":
+            continue
         model_faces: list[ElementFace] = []
         for entry in entries:
             for element_id in _resolve_element_target(entry.target, element_sets):

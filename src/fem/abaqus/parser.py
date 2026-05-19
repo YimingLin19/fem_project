@@ -56,11 +56,32 @@ class _ParserState:
         self.current_step: AbaqusStep | None = None
         self.current_output_kind: str | None = None
         self.current_output_target: str | None = None
+        self.scope = "model"
+        self.current_set_accepts_data = True
+        self.current_surface_accepts_data = True
 
     def handle_keyword(self, keyword: Keyword) -> None:
         """Dispatch a keyword line and update data mode."""
         self.keyword = keyword
         self.mode = None
+        self.current_set_accepts_data = True
+        self.current_surface_accepts_data = True
+
+        if keyword.name == "part":
+            self.scope = "part"
+            return
+
+        if keyword.name == "end part":
+            self.scope = "model"
+            return
+
+        if keyword.name == "assembly":
+            self.scope = "assembly"
+            return
+
+        if keyword.name == "end assembly":
+            self.scope = "model"
+            return
 
         if keyword.name == "node":
             self.mode = "node"
@@ -80,7 +101,12 @@ class _ParserState:
 
         if keyword.name == "surface":
             name = _required_param(keyword, "name")
-            self.deck.surfaces.setdefault(name, [])
+            self.current_surface_accepts_data = self._prepare_scoped_collection(
+                self.deck.surfaces,
+                self.deck.surface_scopes,
+                name,
+                self._keyword_scope(keyword),
+            )
             self.mode = "surface"
             return
 
@@ -164,9 +190,17 @@ class _ParserState:
         elif self.mode == "element":
             self._add_element(values)
         elif self.mode == "nset":
-            self._extend_set(self.deck.node_sets, values)
+            self._extend_set(
+                self.deck.node_sets,
+                self.deck.node_set_scopes,
+                values,
+            )
         elif self.mode == "elset":
-            self._extend_set(self.deck.element_sets, values)
+            self._extend_set(
+                self.deck.element_sets,
+                self.deck.element_set_scopes,
+                values,
+            )
         elif self.mode == "surface":
             self._add_surface(values)
         elif self.mode == "density":
@@ -190,11 +224,26 @@ class _ParserState:
         name_key = "nset" if mode == "nset" else "elset"
         name = _required_param(self.keyword, name_key)
         target = self.deck.node_sets if mode == "nset" else self.deck.element_sets
-        target.setdefault(name, [])
+        scopes = self.deck.node_set_scopes if mode == "nset" else self.deck.element_set_scopes
+        self.current_set_accepts_data = self._prepare_scoped_collection(
+            target,
+            scopes,
+            name,
+            self._keyword_scope(self.keyword),
+        )
         self.mode = mode
 
-    def _extend_set(self, target: dict[str, list[int]], values: list[str]) -> None:
+    def _extend_set(
+        self,
+        target: dict[str, list[int]],
+        scopes: dict[str, str],
+        values: list[str],
+    ) -> None:
+        if not self.current_set_accepts_data:
+            return
         name = _required_param(self.keyword, self.mode)
+        scope = self._keyword_scope(self.keyword)
+        self._prepare_scoped_collection(target, scopes, name, scope)
         if self.keyword and "generate" in self.keyword.flags:
             ids = _generate_ids(values)
         else:
@@ -219,15 +268,53 @@ class _ParserState:
         )
         self.deck.elements.append(element)
         if element_set is not None:
-            self.deck.element_sets.setdefault(element_set, []).append(element.id)
+            scope = self._keyword_scope(self.keyword)
+            if self._prepare_scoped_collection(
+                self.deck.element_sets,
+                self.deck.element_set_scopes,
+                element_set,
+                scope,
+            ):
+                self.deck.element_sets[element_set].append(element.id)
 
     def _add_surface(self, values: list[str]) -> None:
-        if len(values) < 2:
+        if len(values) < 2 or not self.current_surface_accepts_data:
             return
         name = _required_param(self.keyword, "name")
         self.deck.surfaces[name].append(
             AbaqusSurfaceFace(_parse_target(values[0]), values[1].upper())
         )
+
+    def _keyword_scope(self, keyword: Keyword | None) -> str:
+        """Return the scope for a keyword definition."""
+        if keyword is not None and "instance" in keyword.params:
+            return "assembly"
+        return self.scope
+
+    def _prepare_scoped_collection(
+        self,
+        target: dict[str, list],
+        scopes: dict[str, str],
+        name: str,
+        scope: str,
+    ) -> bool:
+        """Prepare a named collection and handle cross-scope redefinitions."""
+        existing_scope = scopes.get(name)
+        if existing_scope is None:
+            target[name] = []
+            scopes[name] = scope
+            return True
+        if existing_scope == scope:
+            return True
+        if scope == "assembly":
+            target[name] = []
+            scopes[name] = scope
+            return True
+        if existing_scope == "assembly":
+            return False
+        target[name] = []
+        scopes[name] = scope
+        return True
 
     def _add_density(self, values: list[str]) -> None:
         if self.current_material is None:

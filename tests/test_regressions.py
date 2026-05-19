@@ -1495,6 +1495,60 @@ class AbaqusModelReaderTests(unittest.TestCase):
         self.assertEqual(len(step2_bc.prescribed_displacements), 2)
         self.assertAlmostEqual(sum(step2_bc.nodal_forces.values()), 20.0)
 
+    def test_abaqus_read_prefers_assembly_node_set_over_part_set_for_load_targets(self):
+        from fem import abaqus
+
+        path = Path("results") / "test_abaqus_scoped_node_sets.inp"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    "*Part, name=BLOCK",
+                    "*Node",
+                    "1, 0., 0., 0.",
+                    "2, 1., 0., 0.",
+                    "3, 0., 1., 0.",
+                    "4, 0., 0., 1.",
+                    "*Element, type=C3D4, elset=SOLID",
+                    "1, 1,2,3,4",
+                    "*Nset, nset=LOADSET, generate",
+                    "1, 4, 1",
+                    "*Elset, elset=SOLID",
+                    "1",
+                    "*Solid Section, elset=SOLID, material=STEEL",
+                    "*End Part",
+                    "*Assembly, name=Assembly",
+                    "*Instance, name=BLOCK-1, part=BLOCK",
+                    "*End Instance",
+                    "*Nset, nset=LOADSET, instance=BLOCK-1",
+                    "2",
+                    "*Nset, nset=FIXED, instance=BLOCK-1",
+                    "1",
+                    "*End Assembly",
+                    "*Material, name=STEEL",
+                    "*Elastic",
+                    "210., 0.3",
+                    "*Step, name=LOAD",
+                    "*Static",
+                    "*Boundary",
+                    "FIXED, 1, 3, 0.",
+                    "*Cload",
+                    "LOADSET, 2, -1000.",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        model = abaqus.read(path)
+        from fem.solvers import static_linear
+
+        bc = static_linear.boundary_for_step(model, "LOAD")
+
+        self.assertEqual(model.node_sets["LOADSET"].node_ids, (2,))
+        self.assertEqual(len(bc.nodal_forces), 1)
+        self.assertAlmostEqual(sum(bc.nodal_forces.values()), -1000.0)
+
     def test_abaqus_read_converts_dsload_and_dload_pressure_to_surface_tractions(self):
         from fem import abaqus
 
